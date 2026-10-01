@@ -1,185 +1,192 @@
+# Load packages used by the app. Install missing packages, if needed.
 library(shiny)
-library(httr)
-library(jsonlite)
-library(DT)
-library(stringr)
-library(tidyverse)
 library(bslib)
-library(janitor)
-library(shinyjs)
-library(shinycssloaders)
+library(thematic)
+library(tidyverse)
+library(gitlink)
 
-# Internal API key (replace with your actual API key)
-OPENAI_API_KEY <- Sys.getenv("OPENAI_API_KEY")
+# Read data from a CSV file and perform data preprocessing
+expansions <- read_csv("data/expansions.csv") |>
+  mutate(evaluation = factor(evaluation, levels = c("None", "A", "B")),
+         propensity = factor(propensity, levels = c("Good", "Average", "Poor")))
 
-ui <- page_fluid(
-  theme = bs_theme(version = 5),
-  useShinyjs(),  # Add this to use shinyjs
-  br(),
-  titlePanel("AI Dataset Generator"),
-  sidebarLayout(
-    sidebarPanel(
-      textInput("description", "Describe the dataset you want", 
-                placeholder = "e.g., health data for a family of 4"),
-      actionButton("generate", "Generate Dataset"),
-      hidden(downloadButton("download", "Download CSV")),  # Hide download button initially
-      br(), br(),
-      uiOutput("summary"),
-      hr(),
-      tags$small("Note: Generated data may not be accurate or suitable for real-world use. The maximum number of records is limited to 25.")
-    ),
-    mainPanel(
-      navset_tab(
-        nav_panel("Data Table", 
-                  br(),
-                  DTOutput("dataset")
-        )
-      )
-    )
-  )
+# Compute expansion rates by trial and group
+expansion_groups <- expansions |>
+  group_by(industry, propensity, contract, evaluation) |>
+  summarize(success_rate = round(mean(outcome == "Won")* 100),
+            avg_amount = round(mean(amount)),
+            avg_days = round(mean(days)),
+            n = n()) |>
+  ungroup()
+
+# Compute expansion rates by trial
+overall_rates <- expansions |>
+  group_by(evaluation) |>
+  summarise(rate = round(mean(outcome == "Won"), 2))
+
+# Restructure expansion rates by trial as a vector
+rates <- structure(overall_rates$rate, names = overall_rates$evaluation)
+
+# Define lists for propensity, contract and industry choices
+propensities <- c("Good", "Average", "Poor")
+contracts <- c("Monthly", "Annual")
+industries <- c("Academia",
+                "Energy",
+                "Finance",
+                "Government",
+                "Healthcare",
+                "Insurance",
+                "Manufacturing",
+                "Non-Profit",
+                "Pharmaceuticals",
+                "Technology")
+
+# Set the default theme for ggplot2 plots
+ggplot2::theme_set(ggplot2::theme_minimal())
+
+# Apply the CSS used by the Shiny app to the ggplot2 plots
+thematic_shiny()
+
+
+# Define the Shiny UI layout
+ui <- page_sidebar(
+  
+  # Set CSS theme
+  theme = bs_theme(bootswatch = "darkly",
+                   bg = "#222222",
+                   fg = "#86C7ED",
+                   success ="#86C7ED"),
+  
+  # Add title
+  title = "Effectiveness of DemoCo App Free Trial by Customer Segment",
+  
+  # Add sidebar elements
+  sidebar = sidebar(title = "Select a segment of data to view",
+                    class ="bg-secondary",
+                    selectInput("industry", "Select industries", choices = industries, selected = "", multiple  = TRUE),
+                    selectInput("propensity", "Select propensities to buy", choices = propensities, selected = "", multiple  = TRUE),
+                    selectInput("contract", "Select contract types", choices = contracts, selected = "", multiple  = TRUE),
+                    "This app compares the effectiveness of two types of free trials, A (30-days) and B (100-days), at converting users into customers.",
+                    tags$img(src = "logo.png", width = "100%", height = "auto")),
+  
+  # Layout non-sidebar elements
+  layout_columns(card(card_header("Conversions over time"),
+                      plotOutput("line")),
+                 card(card_header("Conversion rates"),
+                      plotOutput("bar")),
+                 value_box(title = "Recommended Trial",
+                           value = textOutput("recommended_eval"),
+                           theme_color = "secondary"),
+                 value_box(title = "Customers",
+                           value = textOutput("number_of_customers"),
+                           theme_color = "secondary"),
+                 value_box(title = "Avg Spend",
+                           value = textOutput("average_spend"),
+                           theme_color = "secondary"),
+                 card(card_header("Conversion rates by subgroup"),
+                      tableOutput("table")),
+                 col_widths = c(8, 4, 4, 4, 4, 12),
+                 row_heights = c(4, 1.5, 3))
 )
 
-server <- function(input, output, session) {
-  dataset <- reactiveVal(NULL)
-  summary_text <- reactiveVal("")
+# Define the Shiny server function
+server <- function(input, output) {
   
-  preprocess_csv <- function(csv_string) {
-    # Extract only the CSV part
-    csv_pattern <- "(?s)(.+?\\n(?:[^,\n]+(?:,[^,\n]+)*\n){2,})"
-    csv_match <- str_extract(csv_string, csv_pattern)
-    
-    if (is.na(csv_match)) {
-      stop("No valid CSV data found in the response")
-    }
-    
-    lines <- str_split(csv_match, "\n")[[1]]
-    lines <- lines[lines != ""]  # Remove empty lines
-    
-    # Get the number of columns from the header
-    header <- str_split(lines[1], ",")[[1]]
-    num_cols <- length(header)
-    
-    # Ensure all rows have the same number of columns
-    processed_lines <- sapply(lines[-1], function(line) {  # Skip header
-      cols <- str_split(line, ",")[[1]]
-      if (length(cols) < num_cols) {
-        cols <- c(cols, rep("", num_cols - length(cols)))
-      } else if (length(cols) > num_cols) {
-        cols <- cols[1:num_cols]
-      }
-      cols
-    })
-    
-    # Create a tibble
-    tibble(!!!setNames(as.list(as.data.frame(t(processed_lines))), header))
-  }
-  
-  generate_summary <- function(df) {
-    prompt <- paste("Summarize the following dataset:\n\n",
-                    "Dimensions: ", nrow(df), "rows and", ncol(df), "columns\n\n",
-                    "Variables:\n", paste(names(df), collapse=", "), "\n\n",
-                    "Please provide a brief summary of the dataset dimensions and variable definitions. Keep it concise, about 3-4 sentences.")
-    
-    response <- POST(
-      url = "https://api.openai.com/v1/chat/completions",
-      add_headers(Authorization = paste("Bearer", OPENAI_API_KEY)),
-      content_type_json(),
-      body = toJSON(list(
-        model = "gpt-3.5-turbo-0125",
-        messages = list(
-          list(role = "system", content = "You are a helpful assistant that summarizes datasets."),
-          list(role = "user", content = prompt)
-        )
-      ), auto_unbox = TRUE),
-      encode = "json"
-    )
-    
-    if (status_code(response) == 200) {
-      content <- content(response)
-      summary <- content$choices[[1]]$message$content
-      return(summary)
-    } else {
-      return("Error generating summary. Please try again later.")
-    }
-  }
-  
-  observeEvent(input$generate, {
-    req(input$description)
-    showPageSpinner()
-    
-    prompt <- paste("Generate a fake dataset with at least two variables as a CSV string based on this description:",
-                    input$description, "Include a header row. Limit to 25 rows of data. Ensure all rows have the same number of columns. Do not include any additional text or explanations.")
-    
-    response <- POST(
-      url = "https://api.openai.com/v1/chat/completions",
-      add_headers(Authorization = paste("Bearer", OPENAI_API_KEY)),
-      content_type_json(),
-      body = toJSON(list(
-        model = "gpt-3.5-turbo-0125",
-        messages = list(
-          list(role = "system", content = "You are a helpful assistant that generates fake datasets."),
-          list(role = "user", content = prompt)
-        )
-      ), auto_unbox = TRUE),
-      encode = "json"
-    )
-    
-    if (status_code(response) == 200) {
-      content <- content(response)
-      csv_string <- content$choices[[1]]$message$content
-      
-      tryCatch({
-        # Preprocess the CSV string and create a tibble
-        df <- preprocess_csv(csv_string) %>% clean_names() %>% 
-          mutate(across(everything(), ~ ifelse(suppressWarnings(!is.na(as.numeric(.))), as.numeric(.), as.character(.))))
-        dataset(df)
-        updateSelectInput(session, "variable", choices = names(df))
-        
-        # Generate and set summary
-        summary <- generate_summary(df)
-        summary_text(summary)
-        
-        # Show download button
-        hidePageSpinner()
-        shinyjs::show("download")
-        
-        
-        
-      }, error = function(e) {
-        showNotification(paste("Error parsing CSV:", e$message), type = "error")
-      })
-    } else {
-      showNotification("Error generating dataset. Please try again later.", type = "error")
-    }
-    
-    # Hide loading spinner
-    shinyjs::hide("loading-spinner")
+  # Provide default values for industry, propensity, and contract selections
+  selected_industries <- reactive({
+    if (is.null(input$industry)) industries else input$industry
   })
   
-  output$dataset <- renderDT({
-    req(dataset())
-    datatable(dataset(), rownames = FALSE, options = list(pageLength = 10))
+  selected_propensities <- reactive({
+    if (is.null(input$propensity)) propensities else input$propensity
   })
   
-  
-  output$download <- downloadHandler(
-    filename = function() {
-      "generated_dataset.csv"
-    },
-    content = function(file) {
-      req(dataset())
-      write.csv(dataset(), file, row.names = FALSE)
-    }
-  )
-  
-  output$summary <- renderUI({
-    req(summary_text())
-    div(
-      h4("Dataset Summary"),
-      p(summary_text()),
-      style = "background-color: #f0f0f0; padding: 10px; border-radius: 5px;"
-    )
+  selected_contracts <- reactive({
+    if (is.null(input$contract)) contracts else input$contract
   })
+  
+  # Filter data against selections
+  filtered_expansions <- reactive({
+    expansions |>
+      filter(industry %in% selected_industries(),
+             propensity %in% selected_propensities(),
+             contract %in% selected_contracts())
+  })
+  
+  # Compute conversions by month
+  conversions <- reactive({
+    filtered_expansions() |>
+      mutate(date = floor_date(date, unit = "month")) |>
+      group_by(date, evaluation) |>
+      summarize(n = sum(outcome == "Won")) |>
+      ungroup()
+  })
+  
+  # Retrieve conversion rates for selected groups
+  groups <- reactive({
+    expansion_groups |>
+      filter(industry %in% selected_industries(),
+             propensity %in% selected_propensities(),
+             contract %in% selected_contracts())
+  })
+  
+  # Render text for recommended trial
+  output$recommended_eval <- renderText({
+    recommendation <-
+      filtered_expansions() |>
+      group_by(evaluation) |>
+      summarise(rate = mean(outcome == "Won")) |>
+      filter(rate == max(rate)) |>
+      pull(evaluation)
+    
+    as.character(recommendation[1])
+  })
+  
+  # Render text for number of customers
+  output$number_of_customers <- renderText({
+    sum(filtered_expansions()$outcome == "Won") |>
+      format(big.mark = ",")
+  })
+  
+  # Render text for average spend
+  output$average_spend <- renderText({
+    x <-
+      filtered_expansions() |>
+      filter(outcome == "Won") |>
+      summarise(spend = round(mean(amount))) |>
+      pull(spend)
+    
+    str_glue("${x}")
+  })
+  
+  # Render line plot for conversions over time
+  output$line <- renderPlot({
+    ggplot(conversions(), aes(x = date, y = n, color = evaluation)) +
+      geom_line() +
+      theme(axis.title = element_blank()) +
+      labs(color = "Trial Type")
+  })
+  
+  # Render bar plot for conversion rates by subgroup
+  output$bar <- renderPlot({
+    groups() |>
+      group_by(evaluation) |>
+      summarise(rate = round(sum(n * success_rate) / sum(n), 2)) |>
+      ggplot(aes(x = evaluation, y = rate, fill = evaluation)) +
+      geom_col() +
+      guides(fill = "none") +
+      theme(axis.title = element_blank()) +
+      scale_y_continuous(limits = c(0, 100))
+  })
+  
+  # Render table for conversion rates by subgroup
+  output$table <- renderTable({
+    groups() |>
+      select(industry, propensity, contract, evaluation, success_rate) |>
+      pivot_wider(names_from = evaluation, values_from = success_rate)
+  },
+  digits = 0)
 }
 
-shinyApp(ui, server)
+# Create the Shiny app
+shinyApp(ui = ui, server = server)
